@@ -6,3 +6,11 @@ I made this with help of AI and it's made for personal use mainly. I might updat
 I've used the MIT License so feel free to do whatever you want with the code.
 
 How to install:
+
+1. Add the COPR repository
+
+   dnf copr enable bunnypig/bunnys-simple-alarm-clock
+
+2. Install the program
+
+   dnf install bunnys-simple-alarm-clock
