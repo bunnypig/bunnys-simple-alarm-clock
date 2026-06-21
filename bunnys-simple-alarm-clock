@@ -595,7 +595,7 @@ style.map(
     foreground=[("selected", FG)],
 )
 root.title("Bunny's Simple Alarm Clock")
-root.geometry("780x660")
+root.geometry("780x700")
 
 title = tk.Label(root, bg=BG, fg=FG, text="Alarm Clock", font=("Sans", 20, "bold"))
 title.pack(pady=10)
