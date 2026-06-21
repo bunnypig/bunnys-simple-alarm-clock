@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import threading
+import shutil
+from pathlib import Path
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+CONFIG = Path.home() / ".config" / "bunnysalarmclock.json"
+CONFIG.parent.mkdir(parents=True, exist_ok=True)
+
+DAYS = [
+    ("Mon", 0),
+    ("Tue", 1),
+    ("Wed", 2),
+    ("Thu", 3),
+    ("Fri", 4),
+    ("Sat", 5),
+    ("Sun", 6),
+]
+
+BG = "#1e1e1e"
+FG = "#eeeeee"
+PANEL = "#2b2b2b"
+BUTTON = "#3a3a3a"
+SELECT = "#444444"
+
+alarms = []
+player = None
+ringing_alarm = None
+
+def check_dependencies():
+    missing = []
+
+    if not shutil.which("mpv"):
+        missing.append("mpv")
+
+    if not shutil.which("notify-send"):
+        missing.append("libnotify")
+
+    try:
+        import tkinter
+    except ImportError:
+        missing.append("python3-tkinter")
+
+    if not missing:
+        return
+
+    install = messagebox.askyesno(
+        "Missing dependencies",
+        "Missing packages:\n\n"
+        + "\n".join(missing)
+        + "\n\nInstall them now?"
+    )
+
+    if install:
+        subprocess.Popen([
+            "konsole",
+            "-e",
+            "bash",
+            "-c",
+            "sudo dnf install -y python3-tkinter mpv libnotify; echo; read -p 'Press Enter to close...'"
+        ])
+
+def load():
+    global alarms
+    if CONFIG.exists():
+        try:
+            alarms = json.loads(CONFIG.read_text())
+        except Exception:
+            alarms = []
+    refresh_list()
+
+
+def save():
+    sort_alarms()
+    CONFIG.write_text(json.dumps(alarms, indent=2))
+
+
+def days_text(days):
+    if sorted(days) == list(range(7)):
+        return "Every day"
+    if not days:
+        return "Never"
+    return ", ".join(name for name, num in DAYS if num in days)
+
+def time_left_text(alarm):
+    if not alarm.get("enabled", True):
+        return "Disabled"
+
+    days = alarm.get("days", [])
+    if not days:
+        return "Never"
+
+    now = datetime.now()
+    hour, minute = map(int, alarm["time"].split(":"))
+
+    soonest = None
+
+    for add_days in range(8):
+        candidate = now.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0
+        )
+
+        candidate = candidate.replace(day=now.day) + timedelta(days=add_days)
+
+        if candidate <= now:
+            continue
+
+        if candidate.weekday() in days:
+            soonest = candidate
+            break
+
+    if soonest is None:
+        return "Never"
+
+    diff = soonest - now
+    total_seconds = int(diff.total_seconds())
+
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    if hours >= 24:
+        d = hours // 24
+        h = hours % 24
+        return f"{d}d {h}h {minutes}m"
+
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def sort_alarms():
+    alarms.sort(key=lambda alarm: alarm["time"])
+
+def refresh_list():
+    tree.delete(*tree.get_children())
+    style.configure(
+    "Treeview",
+    background=PANEL,
+    foreground=FG,
+    fieldbackground=PANEL,
+    rowheight=38,
+    font=("Sans", 16),
+    bordercolor=BG,
+)
+
+    for i, alarm in enumerate(alarms):
+        enabled_box = "☑" if alarm.get("enabled", True) else "☐"
+
+        tree.insert(
+            "",
+            tk.END,
+            iid=str(i),
+            values=(
+                enabled_box,
+                alarm["time"],
+                days_text(alarm.get("days", list(range(7)))),
+                time_left_text(alarm),
+            ),
+        )
+
+
+def choose_sound():
+    try:
+        result = subprocess.run(
+            [
+                "kdialog",
+                "--getopenfilename",
+                str(Path.home() / "Downloads"),
+                "Audio files (*.mp3 *.wav *.ogg *.flac *.m4a)",
+            ],
+            text=True,
+            capture_output=True,
+        )
+
+        if result.returncode == 0:
+            return result.stdout.strip()
+
+    except Exception as e:
+        print("kdialog error:", e)
+
+    return filedialog.askopenfilename(
+        title="Choose alarm sound",
+        initialdir=str(Path.home() / "Downloads"),
+        filetypes=[
+            ("Audio files", "*.mp3 *.wav *.ogg *.flac *.m4a"),
+            ("All files", "*.*"),
+        ],
+    )
+
+
+def edit_alarm(index=None):
+    is_new = index is None
+
+    if is_new:
+        alarm = {
+            "time": "07:30",
+            "days": list(range(7)),
+            "sound": "",
+            "enabled": True,
+            "last_triggered": "",
+        }
+    else:
+        alarm = alarms[index].copy()
+
+    win = tk.Toplevel(root)
+    win.configure(bg=BG)
+    win.title("Edit alarm")
+    win.geometry("420x560")
+    win.resizable(False, False)
+    win.transient(root)
+    win.grab_set()
+
+    hour_var = tk.IntVar(value=int(alarm["time"].split(":")[0]))
+    minute_var = tk.IntVar(value=int(alarm["time"].split(":")[1]))
+
+    tk.Label(win, bg=BG, fg=FG, text="Time", font=("Sans", 16, "bold")).pack(pady=(15, 5))
+
+    time_frame = tk.Frame(win, bg=BG)
+    time_frame.pack(pady=5)
+
+    hour_spin = tk.Spinbox(
+        time_frame,
+        from_=0,
+        to=23,
+        wrap=True,
+        width=3,
+        font=("Sans", 22),
+        textvariable=hour_var,
+        format="%02.0f",
+        justify="center",
+    )
+    hour_spin.grid(row=0, column=0)
+
+    tk.Label(time_frame, bg=BG, fg=FG, text=":", font=("Sans", 22)).grid(row=0, column=1)
+
+    minute_spin = tk.Spinbox(
+        time_frame,
+        from_=0,
+        to=59,
+        wrap=True,
+        width=3,
+        font=("Sans", 22),
+        textvariable=minute_var,
+        format="%02.0f",
+        justify="center",
+    )
+    minute_spin.grid(row=0, column=2)
+
+    tk.Label(win, bg=BG, fg=FG, text="Repeat days", font=("Sans", 14, "bold")).pack(pady=(20, 5))
+
+    day_vars = {}
+    days_frame = tk.Frame(win, bg=BG)
+    days_frame.pack()
+
+    selected_days = alarm.get("days", list(range(7)))
+
+    for row, (name, num) in enumerate(DAYS):
+        var = tk.BooleanVar(value=num in selected_days)
+        day_vars[num] = var
+        tk.Checkbutton(days_frame, text=name, variable=var).grid(
+            row=row // 2,
+            column=row % 2,
+            sticky="w",
+            padx=20,
+            pady=3,
+        )
+
+    sound_var = tk.StringVar(value=alarm.get("sound", ""))
+
+    def pick_sound():
+        sound = choose_sound()
+        if sound:
+            sound_var.set(sound)
+
+    tk.Label(win, bg=BG, fg=FG, text="Alarm sound", font=("Sans", 14, "bold")).pack(pady=(20, 5))
+
+    sound_label = tk.Label(
+        win,
+        bg=BG,
+        fg=FG,
+        textvariable=sound_var,
+        wraplength=320,
+        justify="center",
+    )
+    sound_label.pack(pady=5)
+
+    tk.Button(win, bg=BG, fg=FG, text="Choose music file", command=pick_sound).pack(pady=5)
+
+    enabled_var = tk.BooleanVar(value=alarm.get("enabled", True))
+    tk.Checkbutton(win, bg=BG, fg=FG, text="Alarm enabled", variable=enabled_var).pack(pady=10)
+
+    def save_alarm():
+        selected = [num for num, var in day_vars.items() if var.get()]
+
+        if not sound_var.get():
+            messagebox.showerror("Missing sound", "Choose an alarm sound first.")
+            return
+
+        new_alarm = {
+            "time": f"{hour_var.get():02d}:{minute_var.get():02d}",
+            "days": selected,
+            "sound": sound_var.get(),
+            "enabled": enabled_var.get(),
+            "last_triggered": alarm.get("last_triggered", ""),
+        }
+
+        if is_new:
+            alarms.append(new_alarm)
+        else:
+            alarms[index] = new_alarm
+
+        save()
+        refresh_list()
+        win.destroy()
+
+    button_frame = tk.Frame(win, bg=BG)
+    button_frame.pack(pady=15)
+
+    tk.Button(
+        button_frame,
+        bg=BG,
+        fg=FG,
+        text="Save",
+        width=12,
+        command=save_alarm
+    ).grid(row=0, column=0, padx=5)
+
+    tk.Button(
+        button_frame,
+        bg=BG,
+        fg=FG,
+        text="Cancel",
+        width=12,
+        command=win.destroy
+    ).grid(row=0, column=1, padx=5)
+
+
+def enable_all_alarms():
+    for alarm in alarms:
+        alarm["enabled"] = True
+
+    save()
+    refresh_list()
+
+
+def disable_all_alarms():
+    for alarm in alarms:
+        alarm["enabled"] = False
+
+    save()
+    refresh_list()
+
+
+def delete_alarm():
+    selected = tree.selection()
+    if not selected:
+        return
+
+    index = int(selected[0])
+    alarms.pop(index)
+    save()
+    refresh_list()
+
+
+def toggle_alarm():
+    selected = tree.selection()
+    if not selected:
+        return
+
+    index = int(selected[0])
+    alarms[index]["enabled"] = not alarms[index].get("enabled", True)
+    save()
+    refresh_list()
+
+def shift_all_alarms(hours):
+    if not alarms:
+        return
+
+    for alarm in alarms:
+        hour, minute = map(int, alarm["time"].split(":"))
+        hour = (hour + hours) % 24
+        alarm["time"] = f"{hour:02d}:{minute:02d}"
+
+        # Let the shifted alarm trigger again at its new time
+        alarm["last_triggered"] = ""
+
+    save()
+    refresh_list()
+
+def shift_selected_alarm_minutes(minutes):
+    selected = tree.selection()
+
+    if not selected:
+        return
+
+    index = int(selected[0])
+
+    # Save reference to the actual selected alarm before sorting happens
+    selected_alarm = alarms[index]
+
+    hour, minute = map(int, selected_alarm["time"].split(":"))
+
+    total_minutes = (hour * 60 + minute + minutes) % (24 * 60)
+
+    new_hour = total_minutes // 60
+    new_minute = total_minutes % 60
+
+    selected_alarm["time"] = f"{new_hour:02d}:{new_minute:02d}"
+    selected_alarm["last_triggered"] = ""
+
+    save()
+    refresh_list()
+
+    # Reselect the same alarm after sorting moved it
+    new_index = alarms.index(selected_alarm)
+    tree.selection_set(str(new_index))
+    tree.focus(str(new_index))
+    tree.see(str(new_index))
+
+
+def stop_alarm():
+    global player, ringing_alarm
+
+    if player:
+        player.terminate()
+        player = None
+
+    ringing_alarm = None
+    status_label.config(text="No alarm ringing")
+
+
+def on_tree_click(event):
+    region = tree.identify("region", event.x, event.y)
+    column = tree.identify_column(event.x)
+    row = tree.identify_row(event.y)
+
+    if region != "cell" or not row:
+        return
+
+    index = int(row)
+
+    # Checkbox column
+    if column == "#1":
+        alarms[index]["enabled"] = not alarms[index].get("enabled", True)
+        save()
+        refresh_list()
+        return
+
+    # Time column
+    if column == "#2":
+        edit_alarm(index)
+
+def show_alarm_notification(alarm):
+    def worker():
+        try:
+            result = subprocess.run(
+                [
+                    "notify-send",
+                    "--wait",
+                    "--action=stop=Stop alarm",
+                    "--urgency=critical",
+                    "--expire-time=0",
+                    "Alarm ringing",
+                    f"Alarm time: {alarm['time']}",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            if result.stdout.strip() == "stop":
+                root.after(0, stop_alarm)
+
+        except Exception as e:
+            print("Notification error:", e)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def show_alarm_kdialog(alarm):
+    def worker():
+        try:
+            result = subprocess.run(
+                [
+                    "kdialog",
+                    "--title",
+                    "Alarm Clock",
+                    "--yesno",
+                    f"Alarm ringing!\n\nAlarm time: {alarm['time']}",
+                    "--yes-label",
+                    "Stop alarm",
+                    "--no-label",
+                    "Keep ringing",
+                ]
+            )
+
+            if result.returncode == 0:
+                root.after(0, stop_alarm)
+
+        except Exception as e:
+            print("kdialog popup error:", e)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def check_alarms():
+    global player, ringing_alarm
+
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
+    weekday = now.weekday()
+
+    if player is None:
+        for alarm in alarms:
+            if not alarm.get("enabled", True):
+                continue
+
+            if weekday not in alarm.get("days", []):
+                continue
+
+            trigger_key = f"{today}-{current_time}"
+
+            if alarm["time"] == current_time and alarm.get("last_triggered") != trigger_key:
+                alarm["last_triggered"] = trigger_key
+                save()
+
+                ringing_alarm = alarm
+                status_label.config(text=f"ALARM RINGING: {alarm['time']}")
+
+                player = subprocess.Popen([
+                    "mpv",
+                    "--no-video",
+                    "--loop-file=inf",
+                    "--really-quiet",
+                    alarm["sound"],
+                ])
+
+                show_alarm_notification(alarm)
+                show_alarm_kdialog(alarm)
+                break
+
+    root.after(1000, check_alarms)
+
+def update_countdowns():
+    for i, alarm in enumerate(alarms):
+        item_id = str(i)
+
+        if tree.exists(item_id):
+            values = list(tree.item(item_id, "values"))
+            values[3] = time_left_text(alarm)
+            tree.item(item_id, values=values)
+
+    root.after(1000, update_countdowns)
+
+root = tk.Tk()
+
+try:
+    root.tk.call(
+        "wm",
+        "class",
+        root._w,
+        "BunnysSimpleAlarmClock"
+    )
+except Exception:
+    pass
+
+check_dependencies()
+root.configure(bg=BG)
+
+style = ttk.Style()
+style.theme_use("clam")
+
+style.configure(
+    "Treeview",
+    background=PANEL,
+    foreground=FG,
+    fieldbackground=PANEL,
+    rowheight=32,
+    bordercolor=BG,
+)
+
+style.configure(
+    "Treeview.Heading",
+    background=BUTTON,
+    foreground=FG,
+    relief="flat",
+)
+
+style.map(
+    "Treeview",
+    background=[("selected", SELECT)],
+    foreground=[("selected", FG)],
+)
+root.title("Bunny's Simple Alarm Clock")
+root.geometry("780x660")
+
+title = tk.Label(root, bg=BG, fg=FG, text="Alarm Clock", font=("Sans", 20, "bold"))
+title.pack(pady=10)
+
+columns = ("Enabled", "Time", "Days", "Time left")
+tree = ttk.Treeview(root, columns=columns, show="headings", height=12)
+
+tree.heading("Enabled", text="")
+tree.heading("Time", text="Time")
+tree.heading("Days", text="Days")
+tree.heading("Time left", text="Time left")
+
+tree.column("Enabled", width=50, anchor="center")
+tree.column("Time", width=100, anchor="center")
+tree.column("Days", width=220, anchor="center")
+tree.column("Time left", width=180, anchor="center")
+
+tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+tree.bind("<ButtonRelease-1>", on_tree_click)
+
+button_frame = tk.Frame(root, bg=BG)
+button_frame.pack(pady=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="Enable All",
+    command=enable_all_alarms
+).grid(row=0, column=0, padx=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="Disable All",
+    command=disable_all_alarms
+).grid(row=0, column=1, padx=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="Add alarm",
+    command=lambda: edit_alarm()
+).grid(row=0, column=2, padx=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="Delete alarm",
+    command=delete_alarm
+).grid(row=0, column=3, padx=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="+",
+    width=4,
+    command=lambda: shift_all_alarms(1)
+).grid(row=0, column=4, padx=(5))
+
+tk.Label(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="Hour",
+    font=("Sans", 11, "bold")
+).grid(row=0, column=5, padx=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="-",
+    width=4,
+    command=lambda: shift_all_alarms(-1)
+).grid(row=0, column=6, padx=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="+",
+    width=4,
+    command=lambda: shift_selected_alarm_minutes(15)
+).grid(row=1, column=4, padx=(20, 5), pady=5)
+
+tk.Label(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="15 min",
+    font=("Sans", 11, "bold")
+).grid(row=1, column=5, padx=5, pady=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="-",
+    width=4,
+    command=lambda: shift_selected_alarm_minutes(-15)
+).grid(row=1, column=6, padx=5, pady=5)
+
+tk.Button(
+    button_frame,
+    bg=BG,
+    fg=FG,
+    text="Stop Alarm",
+    command=stop_alarm
+).grid(row=0, column=7, padx=5)
+
+status_label = tk.Label(root, bg=BG, fg=FG, text="No alarm ringing", font=("Sans", 12))
+status_label.pack(pady=8)
+
+load()
+check_alarms()
+update_countdowns()
+
+root.mainloop()
